@@ -72,15 +72,13 @@ const muroS = Bodies.rectangle(0, 0, 1000, 20000, { isStatic: true });
 const muroD = Bodies.rectangle(0, 0, 1000, 20000, { isStatic: true });
 Composite.add(engine.world, [pavimento, muroS, muroD]);
 
-// cestino: pixel art di metallo sul tavolo, aperto in alto; quello che ci cade dentro sparisce
+// cestino: bordi e corpo solidi (niente ci passa attraverso di lato); sparisce tutto quello che entra nella bocca
 const vuoiCestino = document.getElementById('vuoiCestino'), grandezza = document.getElementById('grandezza');
 // Immagine: cestino.png (47 x 61 pixel), dal disegno scaricato, con coperchio tolto e bocca aperta.
 // Righe 0-3 = bocca (va dietro ai mattoncini), dalla riga 4 = bordo e corpo (va davanti).
 const imgCestino = new Image(); imgCestino.src = 'cestino.png';
 const CW = 47, CH = 61, BOCCA = 4;
-let cestino = null; // { x, fondo, p, tasca, pareti } quando è acceso
-// Il cestino è un blocco pieno con una tasca poco profonda nella bocca: si cancella solo lì dentro,
-// così un pezzo che lo urta di lato (o ci finisce contro per una collisione strana) non sparisce.
+let cestino = null; // { x, fondo, p, top, zona, pareti } quando è acceso
 function aggiornaCestino() {
   if (cestino) Composite.remove(engine.world, cestino.pareti);
   cestino = null;
@@ -90,17 +88,28 @@ function aggiornaCestino() {
   grandezza.max = maxP;
   const p = Math.min(+grandezza.value, maxP);
   const x = 12, fondo = HH - SUOLO, top = fondo - CH * p;
-  const tasca = { x0: x + 4 * p, x1: x + 43 * p, y0: top + 2 * p, y1: Math.min(fondo - 8 * p, top + 9 * p + 1.8 * H) };
+  // la bocca che cancella: fra i due bordi, da appena sotto la loro cima fino al corpo solido.
+  // Tutto quello che ci entra anche solo con un angolo sparisce, quindi niente resta incastrato all'entrata.
+  // y0 = riga 4 del disegno, dove comincia il cerchio davanti: il pezzo sparisce mentre ci passa dietro
+  const y0 = top + 4 * p + Math.round(CH * p * 0.1); // 10% dell'altezza del cestino sotto il cerchio
+  const zona = { x0: x + 4 * p, x1: x + 43 * p, y0, y1: y0 + 5 * p + H };
   const blocco = (x0, y0, x1, y1) => Bodies.rectangle((x0 + x1) / 2, (y0 + y1) / 2, x1 - x0, y1 - y0, { isStatic: true, friction: 0.5 });
   const pareti = [
-    blocco(x + p, top + p, x + 4 * p, tasca.y1),            // bordo sinistro della bocca
-    blocco(x + 43 * p, top + p, x + 46 * p, tasca.y1),      // bordo destro
-    blocco(x + 3 * p, tasca.y1, x + 44 * p, fondo),          // corpo pieno sotto la tasca
+    blocco(x + 2 * p, top + p, x + 4 * p, zona.y1),     // bordo sinistro della bocca
+    blocco(x + 43 * p, top + p, x + 45 * p, zona.y1),   // bordo destro
+    blocco(x + 2 * p, zona.y1, x + 45 * p, fondo),      // corpo: pieno e spesso, così un urto di lato non lo attraversa
   ];
-  cestino = { x, fondo, p, top, tasca, pareti };
+  cestino = { x, fondo, p, top, pareti, zona };
   Composite.add(engine.world, pareti);
 }
-const dentroCestino = q => cestino && q.x > cestino.tasca.x0 && q.x < cestino.tasca.x1 && q.y > cestino.tasca.y0 && q.y < cestino.tasca.y1;
+// un pezzo entra se uno dei suoi mattoncini tocca la bocca, anche solo con un angolo
+const toccaCestino = g => {
+  const z = cestino.zona;
+  return g.bricks.some(({ part: { vertices: v } }) => { // rettangolo del mattoncino (da vertici: senza l'allungo della velocità)
+    const xs = v.map(q => q.x), ys = v.map(q => q.y);
+    return Math.max(...xs) > z.x0 && Math.min(...xs) < z.x1 && Math.max(...ys) > z.y0 && Math.min(...ys) < z.y1;
+  });
+};
 let W = 0, HH = 0;
 function ridimensiona() {
   const r = scena.getBoundingClientRect(), dpr = devicePixelRatio || 1;
@@ -331,7 +340,7 @@ canvas.addEventListener('contextmenu', e => e.preventDefault());
 // ---- cestino: quello che ci finisce dentro (col suo centro) sparisce ----
 const buttati = [];
 function butta(g) {
-  const now = performance.now(), fondo = { x: (cestino.tasca.x0 + cestino.tasca.x1) / 2, y: cestino.tasca.y1 - H / 2 };
+  const z = cestino.zona, now = performance.now(), fondo = { x: (z.x0 + z.x1) / 2, y: z.y0 + 1.5 * H };
   for (const b of g.bricks) buttati.push({ b, da: { ...b.part.position }, a: angolo(g), t0: now, fondo });
   togli(g);
   sbuffo(g.body.position.x, g.body.position.y, 10, '#ffffff', 3);
@@ -481,7 +490,7 @@ function ciclo(now) {
     if ((daControllo += PASSO) > 333) { daControllo = 0; controllaCarichi(); }
   }
   if (cestino) for (const g of [...gruppi]) // canestro! (quello che tieni in mano no: sparisce quando lo lasci)
-    if (!(presa && presa.b.gruppo === g) && dentroCestino(g.body.position)) butta(g);
+    if (!(presa && presa.b.gruppo === g) && toccaCestino(g)) butta(g);
   disegna(now, dt / BASE);
   requestAnimationFrame(ciclo);
 }
