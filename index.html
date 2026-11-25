@@ -1,0 +1,526 @@
+<!doctype html>
+<!-- Codice di Emanuele Parmegiani -->
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mattoncini</title>
+<style>
+:root { --muro:#efe6d8; --tavolo:#a8744a; --testo:#2b2420; --barra:#fffaf2; --bordo:#d9ccb8; }
+* { box-sizing:border-box; }
+html, body { margin:0; height:100%; background:var(--muro); color:var(--testo); font:16px/1.4 system-ui, sans-serif;
+  overflow:hidden; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+body { display:flex; flex-direction:column; height:100dvh; }
+#scena { flex:1; position:relative; min-height:0; }
+canvas { display:block; width:100%; height:100%; touch-action:none; }
+#aiuto { position:absolute; top:10px; left:16px; right:140px; margin:0; font-size:14px; pointer-events:none; opacity:.75; }
+#angolo { position:absolute; top:8px; right:8px; display:flex; flex-direction:column; align-items:flex-end; gap:6px; }
+.spunta { display:flex; align-items:center; gap:8px; min-height:44px; cursor:pointer; }
+.spunta[hidden] { display:none; }
+.spunta input[type="checkbox"] { width:22px; height:22px; margin:0; accent-color:#0055bf; cursor:pointer; }
+.spunta input[type="range"] { width:130px; accent-color:#0055bf; cursor:pointer; }
+button { font:inherit; color:inherit; cursor:pointer; border:1px solid var(--bordo); background:var(--barra);
+  border-radius:10px; min-width:44px; min-height:44px; padding:0 10px; }
+button:focus-visible { outline:3px solid #0055bf; outline-offset:2px; }
+#barra { background:var(--barra); border-top:1px solid var(--bordo); display:flex; flex-wrap:wrap; gap:8px 28px;
+  justify-content:center; align-items:center; padding:8px 16px calc(8px + env(safe-area-inset-bottom)); }
+.riga { display:flex; gap:6px; align-items:center; }
+.colore { width:44px; padding:0; border-radius:50%; border:2px solid rgba(0,0,0,.18); }
+.colore[aria-pressed="true"] { box-shadow:0 0 0 3px var(--barra), 0 0 0 5px var(--testo); }
+.misura { padding:0 8px; display:flex; align-items:center; justify-content:center; }
+.misura svg { display:block; }
+</style>
+</head>
+<body>
+<div id="scena">
+  <canvas aria-label="Piano di gioco con i mattoncini"></canvas>
+  <p id="aiuto">Trascina per spostare e agganciare. Tieni premuto (o tocca) un mattoncino per staccarlo da quello sotto.</p>
+  <div id="angolo">
+    <div class="riga">
+      <button id="suono" aria-pressed="true" aria-label="Suono">🔊</button>
+      <button id="svuota">Svuota</button>
+    </div>
+  </div>
+</div>
+<div id="barra">
+  <div class="riga" id="colori" role="group" aria-label="Colore"></div>
+  <div class="riga" id="misure" role="group" aria-label="Aggiungi un mattoncino"></div>
+  <div class="riga" style="gap:20px">
+    <label class="spunta"><input type="checkbox" id="vuoiCestino"> Cestino</label>
+    <label class="spunta" id="boxGrandezza" hidden>Grandezza <input type="range" id="grandezza" min="2" max="14" value="5"></label>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+<script>
+const { Engine, Bodies, Body, Composite, Sleeping } = Matter;
+const canvas = document.querySelector('canvas'), ctx = canvas.getContext('2d'), scena = document.getElementById('scena');
+
+// misure: passo fra i pallini, altezza del mattoncino, pallino
+const S = Math.round(Math.max(22, Math.min(34, innerWidth / 16))), H = S * 1.2, SW = S * 0.6, SH = S * 0.22;
+const SUOLO = 28;
+// ponytail: tenuta tarata a occhio. FORZA = quanto sbalzo regge un pallino, TIRO = quanto peso ci può pendere sotto
+const FORZA = 10, TIRO = 8, TIENI = 450; // ms da tenere premuto per staccare
+const COLORI = [['Rosso', '#c91a09'], ['Blu', '#0055bf'], ['Giallo', '#f2cd37'], ['Verde', '#237841'],
+  ['Arancione', '#fe8a18'], ['Bianco', '#f4f4f4'], ['Nero', '#27313a']];
+const MISURE = [1, 2, 3, 4, 6];
+
+const engine = Engine.create({ enableSleeping: true, positionIterations: 10, velocityIterations: 8 });
+engine.gravity.y = 1.2;
+const pavimento = Bodies.rectangle(0, 0, 20000, 1000, { isStatic: true, friction: 1 });
+const muroS = Bodies.rectangle(0, 0, 1000, 20000, { isStatic: true });
+const muroD = Bodies.rectangle(0, 0, 1000, 20000, { isStatic: true });
+Composite.add(engine.world, [pavimento, muroS, muroD]);
+
+// cestino: pixel art di metallo sul tavolo, aperto in alto; quello che ci cade dentro sparisce
+const vuoiCestino = document.getElementById('vuoiCestino'), grandezza = document.getElementById('grandezza');
+// Immagine: cestino.png (47 x 61 pixel), dal disegno scaricato, con coperchio tolto e bocca aperta.
+// Righe 0-3 = bocca (va dietro ai mattoncini), dalla riga 4 = bordo e corpo (va davanti).
+const imgCestino = new Image(); imgCestino.src = 'cestino.png';
+const CW = 47, CH = 61, BOCCA = 4;
+let cestino = null; // { x, fondo, p, tasca, pareti } quando è acceso
+// Il cestino è un blocco pieno con una tasca poco profonda nella bocca: si cancella solo lì dentro,
+// così un pezzo che lo urta di lato (o ci finisce contro per una collisione strana) non sparisce.
+function aggiornaCestino() {
+  if (cestino) Composite.remove(engine.world, cestino.pareti);
+  cestino = null;
+  if (!vuoiCestino.checked) return;
+  // grandezza = quanti px è un pixel del disegno (intero, così resta nitido); al massimo poco meno di metà schermo
+  const maxP = Math.max(2, Math.min(Math.floor(W * 0.45 / CW), Math.floor(HH * 0.6 / CH)));
+  grandezza.max = maxP;
+  const p = Math.min(+grandezza.value, maxP);
+  const x = 12, fondo = HH - SUOLO, top = fondo - CH * p;
+  const tasca = { x0: x + 4 * p, x1: x + 43 * p, y0: top + 2 * p, y1: Math.min(fondo - 8 * p, top + 9 * p + 1.8 * H) };
+  const blocco = (x0, y0, x1, y1) => Bodies.rectangle((x0 + x1) / 2, (y0 + y1) / 2, x1 - x0, y1 - y0, { isStatic: true, friction: 0.5 });
+  const pareti = [
+    blocco(x + p, top + p, x + 4 * p, tasca.y1),            // bordo sinistro della bocca
+    blocco(x + 43 * p, top + p, x + 46 * p, tasca.y1),      // bordo destro
+    blocco(x + 3 * p, tasca.y1, x + 44 * p, fondo),          // corpo pieno sotto la tasca
+  ];
+  cestino = { x, fondo, p, top, tasca, pareti };
+  Composite.add(engine.world, pareti);
+}
+const dentroCestino = q => cestino && q.x > cestino.tasca.x0 && q.x < cestino.tasca.x1 && q.y > cestino.tasca.y0 && q.y < cestino.tasca.y1;
+let W = 0, HH = 0;
+function ridimensiona() {
+  const r = scena.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  W = r.width; HH = r.height;
+  canvas.width = W * dpr; canvas.height = HH * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  Body.setPosition(pavimento, { x: W / 2, y: HH - SUOLO + 500 });
+  Body.setPosition(muroS, { x: -500, y: HH / 2 });
+  Body.setPosition(muroD, { x: W + 500, y: HH / 2 });
+  aggiornaCestino();
+}
+ridimensiona();
+new ResizeObserver(ridimensiona).observe(scena); // anche quando la barra sotto cambia altezza, non solo la finestra
+
+// ---- geometria ----
+const rot = (v, a) => ({ x: v.x * Math.cos(a) - v.y * Math.sin(a), y: v.x * Math.sin(a) + v.y * Math.cos(a) });
+const piu = (a, b) => ({ x: a.x + b.x, y: a.y + b.y }), meno = (a, b) => ({ x: a.x - b.x, y: a.y - b.y });
+const norm = a => a - 2 * Math.PI * Math.round(a / (2 * Math.PI));
+const centroLocale = b => ({ x: (b.gx + b.w / 2) * S, y: b.gy * H });
+const sovrap = (a, b) => Math.min(a.gx + a.w, b.gx + b.w) - Math.max(a.gx, b.gx);
+const uniti = (a, b) => Math.abs(a.gy - b.gy) === 1 && sovrap(a, b) > 0;
+
+// Un gruppo è una costruzione: mattoncini agganciati = un solo corpo rigido.
+// Ogni mattoncino ha una casella (gx colonna del primo pallino, gy riga) nella griglia del suo gruppo.
+const gruppi = new Set();
+const angolo = g => g.theta0 + g.body.angle;
+function origine(g) {
+  const b = g.bricks[0];
+  return meno(b.part.position, rot(centroLocale(b), angolo(g)));
+}
+function creaGruppo(bricks, O, a, vel = { x: 0, y: 0 }, va = 0) {
+  const parts = bricks.map(b => {
+    const c = piu(O, rot(centroLocale(b), a));
+    const p = Bodies.rectangle(c.x, c.y, b.w * S, H, { angle: a });
+    p.brick = b; b.part = p; return p;
+  });
+  const body = Body.create({ parts, friction: 0.9, frictionStatic: 1, restitution: 0, frictionAir: 0 });
+  Body.setVelocity(body, vel); Body.setAngularVelocity(body, va);
+  const g = { body, bricks, theta0: a };
+  bricks.forEach(b => b.gruppo = g);
+  gruppi.add(g); Composite.add(engine.world, body);
+  return g;
+}
+function togli(g) { gruppi.delete(g); Composite.remove(engine.world, g.body); }
+// rifà il gruppo g come più gruppi (stessa griglia, stessa velocità)
+function ricostruisci(g, liste) {
+  const O = origine(g), a = angolo(g), v = Body.getVelocity(g.body), va = Body.getAngularVelocity(g.body);
+  togli(g);
+  return liste.map(l => creaGruppo(l, O, a, v, va));
+}
+// pezzi collegati fra loro, facendo finta che i legami per cui taglia(a, b) è vero non ci siano
+function pezzi(bricks, taglia = () => false) {
+  const resto = new Set(bricks), out = [];
+  while (resto.size) {
+    const [primo] = resto; resto.delete(primo);
+    const comp = [primo];
+    for (let i = 0; i < comp.length; i++)
+      for (const b of [...resto])
+        if (uniti(comp[i], b) && !taglia(comp[i], b)) { resto.delete(b); comp.push(b); }
+    out.push(comp);
+  }
+  return out;
+}
+
+// ---- azioni ----
+let colore = COLORI[0][1];
+function nuovo(w) {
+  const a = (Math.random() - 0.5) * 0.3, now = performance.now();
+  const b = { w, colore, gx: 0, gy: 0, nato: now, pop: -1e9 };
+  // cade a caso verso il centro, ma sempre a destra del cestino
+  const lo = (cestino ? cestino.x + CW * cestino.p + 10 : 0) + w * S / 2 + 10, hi = W - w * S / 2 - 10;
+  const mezzo = hi > lo ? Math.max(lo, Math.min(hi, W / 2)) : W / 2, giro = hi > lo ? Math.min(hi - lo, 240) / 2 : 0;
+  const pos = { x: Math.max(lo, Math.min(hi, mezzo + (Math.random() - 0.5) * 2 * giro)), y: -H };
+  creaGruppo([b], meno(pos, rot(centroLocale(b), a)), a, { x: 0, y: 2 }, (Math.random() - 0.5) * 0.04);
+}
+// tocco su un mattoncino: si stacca da quelli sotto (o, se non ne ha, da quelli sopra)
+// e si porta dietro tutto quello che resta attaccato a lui
+function stacca(b, inMano) {
+  const g = b.gruppo, now = performance.now();
+  const haSotto = g.bricks.some(x => x.gy === b.gy + 1 && uniti(x, b));
+  const lato = haSotto ? 1 : -1;
+  const taglia = (p, q) => (p === b && q.gy === b.gy + lato) || (q === b && p.gy === b.gy + lato);
+  const parti = pezzi(g.bricks, taglia);
+  b.pop = now;
+  if (parti.length < 2) { suono('tok'); return; } // è tenuto anche da un'altra parte
+  const nuovi = ricostruisci(g, parti), mio = nuovi.find(x => x.bricks.includes(b));
+  if (haSotto && !inMano) Body.setVelocity(mio.body, { x: 0, y: -3 }); // saltino verso l'alto
+  mio.bricks.forEach(x => x.pop = now);
+  const p = piu(b.part.position, rot({ x: 0, y: lato * H / 2 }, angolo(mio)));
+  sbuffo(p.x, p.y, 12, b.colore, 4);
+  suono('pop');
+}
+// aggancia il pezzo D al pezzo della mossa t
+function aggancia(D, t) {
+  togli(D);
+  D.bricks.forEach(d => { d.gx += t.dx; d.gy += t.dy; d.pop = performance.now(); });
+  ricostruisci(t.g, [[...t.g.bricks, ...D.bricks]]);
+  sbuffo(t.pos.x, t.pos.y, 8, '#ffffff', 3);
+  suono('clic');
+}
+// dove si aggancerebbe il pezzo D (preso dal mattoncino r) se lo lasciassi adesso
+function cercaAggancio(D, r) {
+  const p = r.part.position, ad = angolo(D);
+  let best = null;
+  for (const g of gruppi) {
+    if (g === D) continue;
+    const a = angolo(g);
+    if (Math.abs(norm(a - ad)) > 0.8) continue;
+    const O = origine(g), l = rot(meno(p, O), -a);
+    const gy0 = Math.round(l.y / H), gx0 = Math.round(l.x / S - r.w / 2);
+    for (let gy = gy0 - 1; gy <= gy0 + 1; gy++) for (let gx = gx0 - 1; gx <= gx0 + 1; gx++) {
+      const dx = gx - r.gx, dy = gy - r.gy, sposta = d => ({ gx: d.gx + dx, gy: d.gy + dy, w: d.w });
+      let libero = true, unito = false;
+      for (const d of D.bricks) {
+        const q = sposta(d);
+        for (const b of g.bricks) {
+          if (b.gy === q.gy && sovrap(b, q) > 0) { libero = false; break; }
+          if (uniti(b, q)) unito = true;
+        }
+        if (!libero) break;
+      }
+      if (!libero || !unito) continue;
+      const pos = piu(O, rot(centroLocale(sposta(r)), a)), dist = Math.hypot(pos.x - p.x, pos.y - p.y);
+      if (dist < H && (!best || dist < best.dist))
+        best = { g, dx, dy, a, pos, dist, ombre: D.bricks.map(d => ({ b: d, pos: piu(O, rot(centroLocale(sposta(d)), a)) })) };
+    }
+  }
+  return best;
+}
+// se uno sbalzo o un peso appeso è troppo per i pallini che lo tengono, l'aggancio si rompe
+function controllaCarichi() {
+  const appoggiati = new Set();
+  for (const pair of engine.pairs.list)
+    for (const [p, q] of [[pair.bodyA, pair.bodyB], [pair.bodyB, pair.bodyA]])
+      if (p.brick && p.parent !== q.parent && pair.collision.supports.some(s => s && s.y > p.position.y + H * 0.3))
+        appoggiati.add(p.brick);
+
+  for (const g of [...gruppi]) {
+    if (g.bricks.length < 2 || (presa && presa.b.gruppo === g)) continue;
+    const a = angolo(g);
+    if (Math.abs(norm(a)) > 0.35 || g.body.speed > 1.5) continue; // solo costruzioni dritte e ferme
+    const O = origine(g);
+    let peggio = null;
+    for (const x of g.bricks) for (const y of g.bricks) {
+      if (y.gy !== x.gy - 1) continue; // x sotto, y sopra
+      const n = sovrap(x, y);
+      if (n <= 0) continue;
+      const taglia = (p, q) => (p === x && q === y) || (p === y && q === x);
+      const parti = pezzi(g.bricks, taglia);
+      if (parti.length < 2) continue;
+      const [A, B] = parti, okA = A.some(b => appoggiati.has(b)), okB = B.some(b => appoggiati.has(b));
+      if (okA === okB) continue;
+      const carico = okA ? B : A, appeso = carico.includes(x);
+      let M = 0, cx = 0;
+      for (const b of carico) { M += b.w; cx += b.w * b.part.position.x; }
+      cx /= M;
+      const xs = Math.max(x.gx, y.gx);
+      const e1 = piu(O, rot({ x: xs * S, y: (x.gy - 0.5) * H }, a)), e2 = piu(O, rot({ x: (xs + n) * S, y: (x.gy - 0.5) * H }, a));
+      const fuori = Math.max(0, cx - Math.max(e1.x, e2.x), Math.min(e1.x, e2.x) - cx) / S;
+      let r = M * fuori / (n * FORZA);
+      if (appeso) r = Math.max(r, M / (n * TIRO));
+      if (r > 1 && (!peggio || r > peggio.r)) peggio = { r, taglia, J: { x: (e1.x + e2.x) / 2, y: (e1.y + e2.y) / 2 } };
+    }
+    if (peggio) {
+      ricostruisci(g, pezzi(g.bricks, peggio.taglia));
+      sbuffo(peggio.J.x, peggio.J.y, 16, '#8a7d70', 5);
+      suono('crac');
+    }
+  }
+}
+
+// ---- mouse e dita ----
+let presa = null; // { modo: 'attesa' (non ancora mosso) | 'gruppo', b, x, y, x0, y0, t0, lg, aggancio }
+const punto = e => { const r = canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+// ordine di disegno: prima i pezzi più in basso, e dentro un pezzo prima le file di sotto,
+// così i pallini di una fila restano coperti da quella sopra anche se la costruzione è storta
+const tutti = () => [...gruppi].sort((a, b) => b.body.position.y - a.body.position.y)
+  .flatMap(g => [...g.bricks].sort((a, b) => b.gy - a.gy));
+// si prende solo cliccando su quello che si vede: il corpo o un pallino (il primo disegnato sopra vince)
+function trova(p) {
+  for (const b of tutti().reverse()) {
+    const l = rot(meno(p, b.part.position), -angolo(b.gruppo)), w = b.w * S;
+    if (Math.abs(l.x) > w / 2) continue;
+    if (Math.abs(l.y) <= H / 2) return b;
+    const dx = (l.x + w / 2) % S;
+    if (l.y < -H / 2 && l.y >= -H / 2 - SH && dx >= (S - SW) / 2 && dx <= (S + SW) / 2) return b;
+  }
+}
+canvas.addEventListener('pointerdown', e => {
+  sbloccaAudio();
+  if (presa) return;
+  const p = punto(e), b = trova(p);
+  if (!b) return;
+  canvas.setPointerCapture(e.pointerId);
+  presa = { b, id: e.pointerId, x: p.x, y: p.y, x0: p.x, y0: p.y, t0: performance.now(), modo: 'attesa', storia: [] };
+});
+canvas.addEventListener('pointermove', e => {
+  if (!presa || e.pointerId !== presa.id) return;
+  const p = punto(e), t = performance.now(); presa.x = p.x; presa.y = p.y;
+  presa.storia.push({ t, x: p.x, y: p.y });
+  while (presa.storia.length > 2 && t - presa.storia[0].t > 60) presa.storia.shift(); // ultimi 60 ms, per il lancio
+  if (presa.modo === 'attesa' && Math.hypot(p.x - presa.x0, p.y - presa.y0) > 6) inMano();
+});
+function inMano() {
+  const body = presa.b.gruppo.body;
+  presa.modo = 'gruppo';
+  presa.lg = rot(meno({ x: presa.x0, y: presa.y0 }, body.position), -body.angle);
+}
+function lascia(e) {
+  if (!presa || e.pointerId !== presa.id) return;
+  const t = presa.aggancio, g = presa.b.gruppo;
+  if (presa.modo === 'attesa') stacca(presa.b); // clic senza trascinare
+  else if (t && gruppi.has(t.g)) aggancia(g, t);
+  else {
+    // il pezzo parte da dove lo vedi (sotto il cursore) con la velocità del mouse negli ultimi 60 ms
+    Body.setPosition(g.body, piu(g.body.position, meno(presa, piu(g.body.position, rot(presa.lg, g.body.angle)))));
+    const s = presa.storia, a = s[0], z = s[s.length - 1], now = performance.now();
+    let v = { x: 0, y: 0 };
+    if (s.length > 1 && now - z.t < 60 && z.t > a.t) v = { x: (z.x - a.x) / (z.t - a.t) * BASE, y: (z.y - a.y) / (z.t - a.t) * BASE };
+    const k = Math.min(1, 80 / (Math.hypot(v.x, v.y) || 1)); // ponytail: tetto a ~4800 px/s, oltre un pezzo può passare attraverso un altro
+    Body.setVelocity(g.body, { x: v.x * k, y: v.y * k });
+  }
+  presa = null;
+}
+canvas.addEventListener('pointerup', lascia);
+canvas.addEventListener('pointercancel', lascia);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// ---- cestino: quello che ci finisce dentro (col suo centro) sparisce ----
+const buttati = [];
+function butta(g) {
+  const now = performance.now(), fondo = { x: (cestino.tasca.x0 + cestino.tasca.x1) / 2, y: cestino.tasca.y1 - H / 2 };
+  for (const b of g.bricks) buttati.push({ b, da: { ...b.part.position }, a: angolo(g), t0: now, fondo });
+  togli(g);
+  sbuffo(g.body.position.x, g.body.position.y, 10, '#ffffff', 3);
+  suono('pop');
+}
+
+// porta la costruzione presa verso il dito
+function guida() {
+  if (presa.modo === 'attesa') return;
+  const g = presa.b.gruppo, body = g.body;
+  Sleeping.set(body, false);
+  const gp = piu(body.position, rot(presa.lg, body.angle));
+  // arriva sotto il dito in un passo, senza limite di velocità; la velocità di Matter si misura su 1/60 s
+  const v = meno(presa, gp), k = BASE / PASSO;
+  Body.setVelocity(body, { x: v.x * k, y: v.y * k });
+  const meta = presa.aggancio ? presa.aggancio.a : 0;
+  Body.setAngularVelocity(body, norm(meta - angolo(g)) * 0.25); // in mano si raddrizza
+}
+
+// ---- effetti ----
+const scintille = [];
+function sbuffo(x, y, n, c, forza) {
+  for (let i = 0; i < n; i++)
+    scintille.push({ x, y, vx: (Math.random() - 0.5) * forza * 2, vy: -Math.random() * forza, vita: 1, r: 2 + Math.random() * 3, c });
+}
+let audio = null, muto = false;
+function sbloccaAudio() { if (!audio) try { audio = new AudioContext(); } catch (e) {} }
+function suono(tipo) {
+  if (muto || !audio) return;
+  const t = audio.currentTime, out = audio.createGain();
+  out.connect(audio.destination);
+  if (tipo === 'crac') {
+    const len = 0.25, buf = audio.createBuffer(1, audio.sampleRate * len, audio.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length) ** 3;
+    const src = audio.createBufferSource(), f = audio.createBiquadFilter();
+    f.type = 'bandpass'; f.frequency.value = 900;
+    src.buffer = buf; src.connect(f); f.connect(out); out.gain.value = 0.9; src.start(t);
+    return;
+  }
+  const o = audio.createOscillator(), [f0, f1, dur] = { clic: [2600, 1400, 0.04], pop: [700, 260, 0.09], tok: [400, 300, 0.05] }[tipo];
+  o.type = tipo === 'clic' ? 'triangle' : 'sine';
+  o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  out.gain.setValueAtTime(0.3, t); out.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(out); o.start(t); o.stop(t + dur);
+}
+
+// ---- disegno ----
+function scuro(hex, k) {
+  const n = parseInt(hex.slice(1), 16), f = c => Math.round(c * k);
+  return `rgb(${f(n >> 16)},${f((n >> 8) & 255)},${f(n & 255)})`;
+}
+function mattone(b, x, y, a, k, extra) {
+  const w = b.w * S;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(a); ctx.scale(k, k);
+  if (extra) extra();
+  for (let i = 0; i < b.w; i++) {
+    const sx = -w / 2 + (i + 0.5) * S - SW / 2;
+    ctx.fillStyle = b.colore; ctx.fillRect(sx, -H / 2 - SH, SW, SH + 1);
+    ctx.fillStyle = 'rgba(255,255,255,.3)'; ctx.fillRect(sx + 2, -H / 2 - SH + 1, SW * 0.2, SH - 1);
+    ctx.fillStyle = 'rgba(0,0,0,.15)'; ctx.fillRect(sx + SW * 0.8, -H / 2 - SH, SW * 0.2, SH);
+  }
+  ctx.shadowColor = 'transparent';
+  ctx.fillStyle = b.colore;
+  ctx.beginPath(); ctx.roundRect(-w / 2, -H / 2, w, H, 3); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,.16)'; ctx.fillRect(-w / 2, H / 2 - H * 0.14, w, H * 0.14);
+  ctx.fillStyle = 'rgba(255,255,255,.22)'; ctx.fillRect(-w / 2 + 2, -H / 2 + 2, w - 4, 2);
+  ctx.strokeStyle = scuro(b.colore === '#f4f4f4' ? '#c8c8c8' : b.colore, 0.6); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.roundRect(-w / 2 + 0.5, -H / 2 + 0.5, w - 1, H - 1, 3); ctx.stroke();
+  ctx.restore();
+}
+function disegna(now, f) {
+  ctx.clearRect(0, 0, W, HH);
+  ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--tavolo');
+  ctx.fillRect(0, HH - SUOLO, W, SUOLO);
+  ctx.fillStyle = 'rgba(255,255,255,.25)'; ctx.fillRect(0, HH - SUOLO, W, 2);
+  ctx.imageSmoothingEnabled = false; // pixel art nitida
+  // righe del disegno da r0 a r1 (escluso): la bocca va dietro ai mattoncini, il corpo davanti
+  const disegnaCestino = (r0, r1) => imgCestino.complete && ctx.drawImage(imgCestino, 0, r0, CW, r1 - r0,
+    cestino.x, cestino.top + r0 * cestino.p, CW * cestino.p, (r1 - r0) * cestino.p);
+  if (cestino) disegnaCestino(0, BOCCA);
+
+  const presi = presa && presa.modo !== 'attesa' ? presa.b.gruppo : null;
+  // il pezzo in mano si disegna proprio sotto il cursore: la fisica lo raggiunge al passo dopo
+  const off = presi ? meno(presa, piu(presi.body.position, rot(presa.lg, presi.body.angle))) : null;
+  for (const b of tutti()) {
+    let k = 1;
+    const tp = (now - b.pop) / 180; if (tp < 1) k = 1 + 0.12 * Math.sin(tp * Math.PI);
+    const tn = (now - b.nato) / 220; if (tn < 1) k *= 0.6 + 0.4 * (1 - (1 - tn) ** 3);
+    const sel = b.gruppo === presi, p = sel ? piu(b.part.position, off) : b.part.position;
+    mattone(b, p.x, p.y, angolo(b.gruppo), k, sel ? () => {
+      ctx.shadowColor = 'rgba(0,0,0,.28)'; ctx.shadowBlur = 12; ctx.shadowOffsetY = 6;
+    } : null);
+  }
+  if (buttati.length) { // i pezzi buttati rimpiccioliscono sul fondo del cestino
+    for (let i = buttati.length - 1; i >= 0; i--) {
+      const v = buttati[i], t = (now - v.t0) / 260, c = v.fondo;
+      if (t >= 1) { buttati.splice(i, 1); continue; }
+      const e = t * t;
+      ctx.globalAlpha = 1 - t * 0.6;
+      mattone(v.b, v.da.x + (c.x - v.da.x) * e, v.da.y + (c.y - v.da.y) * e, v.a * (1 - e), 1 - e * 0.9);
+    }
+    ctx.globalAlpha = 1;
+  }
+  if (cestino) disegnaCestino(BOCCA, CH); // il corpo, davanti a quello che ci cade dentro
+  if (presa && presa.modo === 'attesa' && now - presa.t0 > 100) { // anello che si riempie mentre tieni premuto
+    const f = Math.min(1, (now - presa.t0) / TIENI);
+    ctx.strokeStyle = 'rgba(43,36,32,.65)'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(presa.x, presa.y, 22, -Math.PI / 2, -Math.PI / 2 + f * Math.PI * 2); ctx.stroke();
+  }
+  if (presa && presa.aggancio) { // sagoma di dove si incastra
+    const t = presa.aggancio;
+    ctx.globalAlpha = 0.35;
+    for (const o of t.ombre) mattone(o.b, o.pos.x, o.pos.y, t.a, 1);
+    ctx.globalAlpha = 1;
+  }
+  for (let i = scintille.length - 1; i >= 0; i--) {
+    const s = scintille[i];
+    s.x += s.vx * f; s.y += s.vy * f; s.vy += 0.25 * f; s.vita -= 0.035 * f;
+    if (s.vita <= 0) { scintille.splice(i, 1); continue; }
+    ctx.globalAlpha = s.vita; ctx.fillStyle = s.c;
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---- ciclo ----
+// la fisica fa un passo per ogni fotogramma dello schermo (60, 120, 144 Hz...), così il pezzo in mano non va a scatti
+const BASE = 1000 / 60;
+let PASSO = BASE, acc = 0, ultimo = performance.now(), daControllo = 0;
+const tempi = [];
+function ciclo(now) {
+  const dt = Math.min(now - ultimo, 100); ultimo = now;
+  if (tempi.length < 30 && dt > 0) {
+    tempi.push(dt);
+    if (tempi.length === 30) PASSO = Math.min(BASE, Math.max(1000 / 165, tempi.sort((a, b) => a - b)[15]));
+  }
+  acc += dt;
+  if (presa) {
+    if (presa.modo === 'attesa' && now - presa.t0 > TIENI) { stacca(presa.b, true); inMano(); } // tenuto premuto: si stacca e resta in mano
+    const mosso = Math.hypot(presa.x - presa.x0, presa.y - presa.y0) > 6; // appena staccato e fermo: non si riaggancia
+    presa.aggancio = presa.modo === 'gruppo' && mosso ? cercaAggancio(presa.b.gruppo, presa.b) : null;
+  }
+  while (acc > PASSO / 2) { // arrotonda: un fotogramma un po' corto o lungo non salta né raddoppia il passo
+    if (presa) guida();
+    Engine.update(engine, PASSO);
+    acc -= PASSO;
+    if ((daControllo += PASSO) > 333) { daControllo = 0; controllaCarichi(); }
+  }
+  if (cestino) for (const g of [...gruppi]) // canestro! (quello che tieni in mano no: sparisce quando lo lasci)
+    if (!(presa && presa.b.gruppo === g) && dentroCestino(g.body.position)) butta(g);
+  disegna(now, dt / BASE);
+  requestAnimationFrame(ciclo);
+}
+requestAnimationFrame(ciclo);
+
+// ---- barra ----
+const boxColori = document.getElementById('colori'), boxMisure = document.getElementById('misure');
+function miniMattone(w) {
+  const sw = 10, h = 14, sh = 4, larg = w * sw;
+  let studs = '';
+  for (let i = 0; i < w; i++) studs += `<rect x="${i * sw + 2}" y="0" width="6" height="${sh + 1}" fill="${colore}"/>`;
+  return `<svg width="${larg}" height="${h + sh}" aria-hidden="true">${studs}<rect x="0" y="${sh}" width="${larg}" height="${h}" rx="2" fill="${colore}" stroke="rgba(0,0,0,.35)"/></svg>`;
+}
+function aggiornaBarra() {
+  boxMisure.innerHTML = '';
+  for (const w of MISURE) {
+    const b = document.createElement('button');
+    b.className = 'misura'; b.innerHTML = miniMattone(w);
+    b.setAttribute('aria-label', `Aggiungi un mattoncino da ${w}`);
+    b.onclick = () => { sbloccaAudio(); nuovo(w); };
+    boxMisure.append(b);
+  }
+}
+for (const [nome, c] of COLORI) {
+  const b = document.createElement('button');
+  b.className = 'colore'; b.style.background = c; b.setAttribute('aria-label', nome);
+  b.setAttribute('aria-pressed', c === colore);
+  b.onclick = () => {
+    colore = c;
+    boxColori.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', x === b));
+    aggiornaBarra();
+  };
+  boxColori.append(b);
+}
+aggiornaBarra();
+vuoiCestino.onchange = () => { document.getElementById('boxGrandezza').hidden = !vuoiCestino.checked; aggiornaCestino(); };
+grandezza.oninput = aggiornaCestino;
+document.getElementById('svuota').onclick = () => { presa = null; [...gruppi].forEach(togli); };
+document.getElementById('suono').onclick = e => { muto = !muto; e.currentTarget.textContent = muto ? '🔇' : '🔊'; e.currentTarget.setAttribute('aria-pressed', !muto); };
+</script>
+</body>
+</html>
